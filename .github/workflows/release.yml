@@ -64,4 +64,12 @@ jobs:
           body: ${{ github.event.inputs.release_notes }}
           prerelease: ${{ github.event.inputs.prerelease }}
           draft: ${{ github.event.inputs.draft }}
-          token: ${{ secrets.RELEASE_PAT }}
+          token: ${{ secrets.RELEASE_PAT }}  
+          
+      - name: Trigger Jenkins build
+        run: |
+            curl -X POST "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+            --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
+            --data-urlencode "tag_name=${{ github.event.inputs.tag_name }}" \
+            --data-urlencode "release_title=${{ github.event.inputs.release_title }}" \
+            --fail   
