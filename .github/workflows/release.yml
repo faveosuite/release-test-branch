@@ -12,6 +12,15 @@ on:
       release_notes:
         description: 'Release notes'
         required: true
+      release_type:
+        description: 'Release type (official / beta / prerelease)'
+        required: false
+        default: 'official'
+        type: choice
+        options:
+          - official
+          - beta
+          - prerelease
       prerelease:
         description: 'Mark as pre-release'
         type: boolean
@@ -91,12 +100,21 @@ jobs:
           TAG="${{ github.event.release.tag_name }}"
           TITLE="${{ github.event.release.name }}"
 
+          if [[ "$TAG" == *"-rc" ]]; then
+            RELEASE_TYPE="prerelease"
+          elif [[ "$TAG" == *"-b" ]]; then
+            RELEASE_TYPE="beta"
+          else
+            RELEASE_TYPE="official"
+          fi
+
           # Trigger the build, capture the queue URL from Location header
           QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
             "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
             --data-urlencode "tag_name=${TAG}" \
             --data-urlencode "release_title=${TITLE}" \
+            --data-urlencode "release_type=${RELEASE_TYPE}" \
             --fail -L)
 
           if [ -z "$QUEUE_URL" ]; then
@@ -106,6 +124,7 @@ jobs:
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
               --data-urlencode "tag_name=${TAG}" \
               --data-urlencode "release_title=${TITLE}" \
+              --data-urlencode "release_type=${RELEASE_TYPE}" \
               | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
           fi
 
