@@ -16,6 +16,10 @@ on:
         description: 'Mark as pre-release'
         type: boolean
         default: false
+      draft:
+        description: 'Save as draft'
+        type: boolean
+        default: false
 
 jobs:
   release:
