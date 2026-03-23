@@ -89,10 +89,10 @@ jobs:
 
           echo "Queue URL: $QUEUE_URL"
 
-          # Poll queue until build number is assigned (up to 2 min)
+          # Poll queue until build number is assigned (up to 10 min)
           BUILD_URL=""
-          for i in $(seq 1 24); do
-            sleep 5
+          for i in $(seq 1 60); do
+            sleep 10
             BUILD_URL=$(curl -s "${QUEUE_URL}api/json" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null)
@@ -102,7 +102,7 @@ jobs:
           done
 
           if [ -z "$BUILD_URL" ]; then
-            echo "::error::Jenkins job did not start within 2 minutes"
+            echo "::error::Jenkins job did not start within 10 minutes — check executor availability"
             exit 1
           fi
 
@@ -136,20 +136,23 @@ jobs:
           import json, urllib.request
 
           webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
-          notes    = """${{ github.event.inputs.release_notes }}"""
-          run_url  = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
 
-          # Extract first line of release notes as the title
-          lines      = notes.strip().splitlines()
-          title_line = lines[0].lstrip("#").strip() if lines else ""
-          body       = "\n".join(lines[1:]).strip()
+          if not webhooks:
+              print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
+          else:
+              notes   = """${{ github.event.inputs.release_notes }}"""
+              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
 
-          text    = f"*{title_line}*\n\n{body}\n\n<{run_url}|View Release>"
-          payload = json.dumps({"text": text}).encode()
+              lines      = notes.strip().splitlines()
+              title_line = lines[0].lstrip("#").strip() if lines else ""
+              body       = "\n".join(lines[1:]).strip()
 
-          for webhook in webhooks:
-              req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
-              urllib.request.urlopen(req)
+              text    = f"*{title_line}*\n\n{body}\n\n<{run_url}|View Release>"
+              payload = json.dumps({"text": text}).encode()
+
+              for webhook in webhooks:
+                  req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+                  urllib.request.urlopen(req)
           EOF
 
       - name: Notify Google Chat on failure
@@ -163,6 +166,10 @@ jobs:
           result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
           build_url = "${{ steps.jenkins.outputs.build_url }}" or "N/A"
           run_url   = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if not webhook.strip():
+              print("GOOGLE_CHAT_WEBHOOK_FAILURE not configured, skipping.")
+              exit(0)
 
           text = (
               f"*Release pipeline FAILED* for tag `{tag}`\n"
