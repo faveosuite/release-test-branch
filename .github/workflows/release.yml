@@ -169,7 +169,7 @@ jobs:
               exit(0)
 
           text = (
-              f"*Release pipeline FAILED* for tag `{tag}`\n"
+              f"*Release: ${{ github.event.inputs.release_title }}* FAILED\n"
               f"*Jenkins result:* {result}\n"
               f"*Jenkins build:* {build_url}\n"
               f"*GitHub run:* {run_url}"
