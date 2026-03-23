@@ -16,10 +16,6 @@ on:
         description: 'Mark as pre-release'
         type: boolean
         default: false
-      draft:    
-          description: 'Save as draft'                                                                                                                                             
-          type: boolean                                                                                                                                                            
-          default: false
 
 jobs:
   release:
@@ -64,12 +60,114 @@ jobs:
           body: ${{ github.event.inputs.release_notes }}
           prerelease: ${{ github.event.inputs.prerelease }}
           draft: ${{ github.event.inputs.draft }}
-          token: ${{ secrets.RELEASE_PAT }}  
-          
-      - name: Trigger Jenkins build
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Trigger Jenkins build and wait
+        id: jenkins
         run: |
-            curl -X POST "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+          # Trigger the build, capture the queue URL from Location header
+          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
+            "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
             --data-urlencode "tag_name=${{ github.event.inputs.tag_name }}" \
             --data-urlencode "release_title=${{ github.event.inputs.release_title }}" \
-            --fail   
+            --fail -L)
+
+          if [ -z "$QUEUE_URL" ]; then
+            # redirect_url empty — fall back to Location header directly
+            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST \
+              "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
+              --data-urlencode "tag_name=${{ github.event.inputs.tag_name }}" \
+              --data-urlencode "release_title=${{ github.event.inputs.release_title }}" \
+              | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
+          fi
+
+          echo "Queue URL: $QUEUE_URL"
+
+          # Poll queue until build number is assigned (up to 2 min)
+          BUILD_URL=""
+          for i in $(seq 1 24); do
+            sleep 5
+            BUILD_URL=$(curl -s "${QUEUE_URL}api/json" \
+              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null)
+            if [ -n "$BUILD_URL" ]; then
+              break
+            fi
+          done
+
+          if [ -z "$BUILD_URL" ]; then
+            echo "::error::Jenkins job did not start within 2 minutes"
+            exit 1
+          fi
+
+          echo "Build URL: $BUILD_URL"
+          echo "build_url=$BUILD_URL" >> $GITHUB_OUTPUT
+
+          # Poll build until complete (up to 30 min)
+          for i in $(seq 1 180); do
+            sleep 10
+            RESULT=$(curl -s "${BUILD_URL}api/json" \
+              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result') or 'IN_PROGRESS')" 2>/dev/null)
+            echo "Jenkins status: $RESULT"
+            if [ "$RESULT" != "IN_PROGRESS" ] && [ "$RESULT" != "null" ] && [ -n "$RESULT" ]; then
+              break
+            fi
+          done
+
+          echo "Final Jenkins result: $RESULT"
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+
+          if [ "$RESULT" != "SUCCESS" ]; then
+            echo "::error::Jenkins build failed with result: $RESULT"
+            exit 1
+          fi
+
+      - name: Notify Google Chat on success
+        if: success()
+        run: |
+          python3 - <<'EOF'
+          import json, urllib.request
+
+          webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
+          notes    = """${{ github.event.inputs.release_notes }}"""
+          run_url  = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
+
+          # Extract first line of release notes as the title
+          lines      = notes.strip().splitlines()
+          title_line = lines[0].lstrip("#").strip() if lines else ""
+          body       = "\n".join(lines[1:]).strip()
+
+          text    = f"*{title_line}*\n\n{body}\n\n<{run_url}|View Release>"
+          payload = json.dumps({"text": text}).encode()
+
+          for webhook in webhooks:
+              req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+              urllib.request.urlopen(req)
+          EOF
+
+      - name: Notify Google Chat on failure
+        if: failure()
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+
+          webhook   = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
+          tag       = "${{ github.event.inputs.tag_name }}"
+          result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
+          build_url = "${{ steps.jenkins.outputs.build_url }}" or "N/A"
+          run_url   = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          text = (
+              f"*Release pipeline FAILED* for tag `{tag}`\n"
+              f"*Jenkins result:* {result}\n"
+              f"*Jenkins build:* {build_url}\n"
+              f"*GitHub run:* {run_url}"
+          )
+
+          payload = json.dumps({"text": text}).encode()
+          req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req)
+          EOF
