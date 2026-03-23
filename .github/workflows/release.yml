@@ -20,9 +20,17 @@ on:
         description: 'Save as draft'
         type: boolean
         default: false
+  release:
+    types: [published]
 
 jobs:
-  release:
+  # ---------------------------------------------------------------
+  # Job 1: Runs on workflow_dispatch (triggered from admin panel)
+  # Handles: rebase, tag, create GitHub release (draft or published)
+  # Jenkins is NOT triggered here — release: published event does it
+  # ---------------------------------------------------------------
+  create-release:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -66,15 +74,29 @@ jobs:
           draft: ${{ github.event.inputs.draft }}
           token: ${{ secrets.RELEASE_PAT }}
 
+  # ---------------------------------------------------------------
+  # Job 2: Runs when a release is published (covers both paths):
+  #   - Direct publish from admin panel (draft=false)
+  #   - Draft promoted to published via GitHub UI
+  # Triggers Jenkins exactly once per published release.
+  # ---------------------------------------------------------------
+  trigger-jenkins:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+
+    steps:
       - name: Trigger Jenkins build and wait
         id: jenkins
         run: |
+          TAG="${{ github.event.release.tag_name }}"
+          TITLE="${{ github.event.release.name }}"
+
           # Trigger the build, capture the queue URL from Location header
           QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
             "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-            --data-urlencode "tag_name=${{ github.event.inputs.tag_name }}" \
-            --data-urlencode "release_title=${{ github.event.inputs.release_title }}" \
+            --data-urlencode "tag_name=${TAG}" \
+            --data-urlencode "release_title=${TITLE}" \
             --fail -L)
 
           if [ -z "$QUEUE_URL" ]; then
@@ -82,8 +104,8 @@ jobs:
             QUEUE_URL=$(curl -s -D - -o /dev/null -X POST \
               "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              --data-urlencode "tag_name=${{ github.event.inputs.tag_name }}" \
-              --data-urlencode "release_title=${{ github.event.inputs.release_title }}" \
+              --data-urlencode "tag_name=${TAG}" \
+              --data-urlencode "release_title=${TITLE}" \
               | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
           fi
 
@@ -140,9 +162,9 @@ jobs:
           if not webhooks:
               print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
           else:
-              title   = "${{ github.event.inputs.release_title }}"
-              notes   = """${{ github.event.inputs.release_notes }}"""
-              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
+              title   = "${{ github.event.release.name }}"
+              notes   = "${{ github.event.release.body }}"
+              run_url = "${{ github.event.release.html_url }}"
 
               text    = f"*{title}*\n\n{notes.strip()}\n\n<{run_url}|View Release>"
               payload = json.dumps({"text": text}).encode()
@@ -156,10 +178,9 @@ jobs:
         if: failure()
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.request
+          import json, urllib.request
 
           webhook   = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
-          tag       = "${{ github.event.inputs.tag_name }}"
           result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
           build_url = "${{ steps.jenkins.outputs.build_url }}" or "N/A"
           run_url   = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -169,7 +190,7 @@ jobs:
               exit(0)
 
           text = (
-              f"*Release: ${{ github.event.inputs.release_title }}* FAILED\n"
+              f"*Release: ${{ github.event.release.name }}* FAILED\n"
               f"*Jenkins result:* {result}\n"
               f"*Jenkins build:* {build_url}\n"
               f"*GitHub run:* {run_url}"
