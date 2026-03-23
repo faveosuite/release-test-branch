@@ -11,7 +11,7 @@ on:
         required: true
       release_notes:
         description: 'Release notes'
-        required: true
+        required: false
       release_type:
         description: 'Release type (official / beta / prerelease)'
         required: false
@@ -29,17 +29,21 @@ on:
         description: 'Save as draft'
         type: boolean
         default: false
+      jenkins_only:
+        description: 'Skip git/release steps — only trigger Jenkins build'
+        type: boolean
+        default: false
   release:
     types: [published]
 
 jobs:
   # ---------------------------------------------------------------
   # Job 1: Runs on workflow_dispatch (triggered from admin panel)
+  # Skipped when jenkins_only=true or triggered by release event.
   # Handles: rebase, tag, create GitHub release (draft or published)
-  # Jenkins is NOT triggered here — release: published event does it
   # ---------------------------------------------------------------
   create-release:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.jenkins_only != 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -84,29 +88,42 @@ jobs:
           token: ${{ secrets.RELEASE_PAT }}
 
   # ---------------------------------------------------------------
-  # Job 2: Runs when a release is published (covers both paths):
-  #   - Direct publish from admin panel (draft=false)
-  #   - Draft promoted to published via GitHub UI
-  # Triggers Jenkins exactly once per published release.
+  # Job 2: Triggers Jenkins. Runs in two cases:
+  #   a) release: published event (direct publish or draft → publish)
+  #   b) workflow_dispatch with jenkins_only=true (manual re-trigger)
   # ---------------------------------------------------------------
   trigger-jenkins:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.jenkins_only == 'true')
     runs-on: ubuntu-latest
 
     steps:
       - name: Trigger Jenkins build and wait
         id: jenkins
+        env:
+          EVENT_NAME:          ${{ github.event_name }}
+          INPUT_TAG:           ${{ github.event.inputs.tag_name }}
+          INPUT_TITLE:         ${{ github.event.inputs.release_title }}
+          INPUT_RELEASE_TYPE:  ${{ github.event.inputs.release_type }}
+          RELEASE_TAG:         ${{ github.event.release.tag_name }}
+          RELEASE_TITLE:       ${{ github.event.release.name }}
         run: |
-          TAG="${{ github.event.release.tag_name }}"
-          TITLE="${{ github.event.release.name }}"
-
-          if [[ "$TAG" == *"-rc" ]]; then
-            RELEASE_TYPE="prerelease"
-          elif [[ "$TAG" == *"-b" ]]; then
-            RELEASE_TYPE="beta"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            TITLE="$INPUT_TITLE"
+            RELEASE_TYPE="$INPUT_RELEASE_TYPE"
           else
-            RELEASE_TYPE="official"
+            TAG="$RELEASE_TAG"
+            TITLE="$RELEASE_TITLE"
+            if [[ "$TAG" == *"-rc" ]]; then
+              RELEASE_TYPE="prerelease"
+            elif [[ "$TAG" == *"-b" ]]; then
+              RELEASE_TYPE="beta"
+            else
+              RELEASE_TYPE="official"
+            fi
           fi
+
+          echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
 
           # Trigger the build, capture the queue URL from Location header
           QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
@@ -118,7 +135,6 @@ jobs:
             --fail -L)
 
           if [ -z "$QUEUE_URL" ]; then
-            # redirect_url empty — fall back to Location header directly
             QUEUE_URL=$(curl -s -D - -o /dev/null -X POST \
               "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
@@ -137,9 +153,7 @@ jobs:
             BUILD_URL=$(curl -s "${QUEUE_URL}api/json" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null)
-            if [ -n "$BUILD_URL" ]; then
-              break
-            fi
+            if [ -n "$BUILD_URL" ]; then break; fi
           done
 
           if [ -z "$BUILD_URL" ]; then
@@ -157,9 +171,7 @@ jobs:
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result') or 'IN_PROGRESS')" 2>/dev/null)
             echo "Jenkins status: $RESULT"
-            if [ "$RESULT" != "IN_PROGRESS" ] && [ "$RESULT" != "null" ] && [ -n "$RESULT" ]; then
-              break
-            fi
+            if [ "$RESULT" != "IN_PROGRESS" ] && [ "$RESULT" != "null" ] && [ -n "$RESULT" ]; then break; fi
           done
 
           echo "Final Jenkins result: $RESULT"
@@ -172,20 +184,30 @@ jobs:
 
       - name: Notify Google Chat on success
         if: success()
+        env:
+          EVENT_NAME:    ${{ github.event_name }}
+          INPUT_TAG:     ${{ github.event.inputs.tag_name }}
+          INPUT_TITLE:   ${{ github.event.inputs.release_title }}
+          RELEASE_TAG:   ${{ github.event.release.tag_name }}
+          RELEASE_TITLE: ${{ github.event.release.name }}
+          RELEASE_URL:   ${{ github.event.release.html_url }}
         run: |
           python3 - <<'EOF'
-          import json, urllib.request
+          import json, os, urllib.request
 
           webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
 
           if not webhooks:
               print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
           else:
-              title   = "${{ github.event.release.name }}"
-              notes   = "${{ github.event.release.body }}"
-              run_url = "${{ github.event.release.html_url }}"
+              if os.environ.get("EVENT_NAME") == "workflow_dispatch":
+                  title   = os.environ.get("INPUT_TITLE", "")
+                  run_url = "https://github.com/${{ github.repository }}/releases/tag/" + os.environ.get("INPUT_TAG", "")
+              else:
+                  title   = os.environ.get("RELEASE_TITLE", "")
+                  run_url = os.environ.get("RELEASE_URL", "")
 
-              text    = f"*{title}*\n\n{notes.strip()}\n\n<{run_url}|View Release>"
+              text    = f"*{title}*\n\n<{run_url}|View Release>"
               payload = json.dumps({"text": text}).encode()
 
               for webhook in webhooks:
@@ -195,9 +217,13 @@ jobs:
 
       - name: Notify Google Chat on failure
         if: failure()
+        env:
+          EVENT_NAME:    ${{ github.event_name }}
+          INPUT_TITLE:   ${{ github.event.inputs.release_title }}
+          RELEASE_TITLE: ${{ github.event.release.name }}
         run: |
           python3 - <<'EOF'
-          import json, urllib.request
+          import json, os, urllib.request
 
           webhook   = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
           result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
@@ -208,8 +234,10 @@ jobs:
               print("GOOGLE_CHAT_WEBHOOK_FAILURE not configured, skipping.")
               exit(0)
 
+          title = os.environ.get("INPUT_TITLE") if os.environ.get("EVENT_NAME") == "workflow_dispatch" else os.environ.get("RELEASE_TITLE", "")
+
           text = (
-              f"*Release: ${{ github.event.release.name }}* FAILED\n"
+              f"*Release: {title}* FAILED\n"
               f"*Jenkins result:* {result}\n"
               f"*Jenkins build:* {build_url}\n"
               f"*GitHub run:* {run_url}"
