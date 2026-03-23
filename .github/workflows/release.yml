@@ -140,14 +140,11 @@ jobs:
           if not webhooks:
               print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
           else:
+              title   = "${{ github.event.inputs.release_title }}"
               notes   = """${{ github.event.inputs.release_notes }}"""
               run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
 
-              lines      = notes.strip().splitlines()
-              title_line = lines[0].lstrip("#").strip() if lines else ""
-              body       = "\n".join(lines[1:]).strip()
-
-              text    = f"*{title_line}*\n\n{body}\n\n<{run_url}|View Release>"
+              text    = f"*{title}*\n\n{notes.strip()}\n\n<{run_url}|View Release>"
               payload = json.dumps({"text": text}).encode()
 
               for webhook in webhooks:
