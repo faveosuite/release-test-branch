@@ -94,22 +94,21 @@ jobs:
 
           echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
 
+          # Encode params for URL query string
+          ENCODED_TAG=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TAG")
+          ENCODED_TITLE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TITLE")
+          ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RELEASE_TYPE")
+
+          JENKINS_URL="https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters?tag_name=${ENCODED_TAG}&release_title=${ENCODED_TITLE}&release_type=${ENCODED_TYPE}"
+
           # Trigger the build, capture the queue URL from Location header
-          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
-            "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST "$JENKINS_URL" \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-            --data-urlencode "tag_name=${TAG}" \
-            --data-urlencode "release_title=${TITLE}" \
-            --data-urlencode "release_type=${RELEASE_TYPE}" \
             --fail -L)
 
           if [ -z "$QUEUE_URL" ]; then
-            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST \
-              "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST "$JENKINS_URL" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              --data-urlencode "tag_name=${TAG}" \
-              --data-urlencode "release_title=${TITLE}" \
-              --data-urlencode "release_type=${RELEASE_TYPE}" \
               | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
           fi
 
@@ -216,22 +215,21 @@ jobs:
 
           echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
 
+          # Encode params for URL query string
+          ENCODED_TAG=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TAG")
+          ENCODED_TITLE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TITLE")
+          ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RELEASE_TYPE")
+
+          JENKINS_URL="https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters?tag_name=${ENCODED_TAG}&release_title=${ENCODED_TITLE}&release_type=${ENCODED_TYPE}"
+
           # Trigger the build, capture the queue URL from Location header
-          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST \
-            "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST "$JENKINS_URL" \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-            --data-urlencode "tag_name=${TAG}" \
-            --data-urlencode "release_title=${TITLE}" \
-            --data-urlencode "release_type=${RELEASE_TYPE}" \
             --fail -L)
 
           if [ -z "$QUEUE_URL" ]; then
-            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST \
-              "https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters" \
+            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST "$JENKINS_URL" \
               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              --data-urlencode "tag_name=${TAG}" \
-              --data-urlencode "release_title=${TITLE}" \
-              --data-urlencode "release_type=${RELEASE_TYPE}" \
               | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
           fi
 
