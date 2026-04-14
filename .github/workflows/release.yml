@@ -1,226 +1,50 @@
-name: Create Release
+name: Release Pipeline
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Tag name (e.g. v1.12.0)'
-        required: true
-      release_title:
-        description: 'Release title'
-        required: true
-      release_notes:
-        description: 'Release notes'
-        required: false
-      release_type:
-        description: 'Release type (official / beta / prerelease)'
-        required: false
-        default: 'official'
-        type: choice
-        options:
-          - official
-          - beta
-          - prerelease
-      prerelease:
-        description: 'Mark as pre-release'
-        type: boolean
-        default: false
-      draft:
-        description: 'Save as draft'
-        type: boolean
-        default: false
-      jenkins_only:
-        description: 'Skip git/release steps — only trigger Jenkins build'
-        type: boolean
-        default: false
+  release:
+    types: [published]
 
 jobs:
   # ---------------------------------------------------------------
-  # Job 1: Runs on workflow_dispatch (full release flow).
-  # Skipped when jenkins_only=true.
-  # Handles: rebase, tag, create GitHub release, trigger Jenkins.
-  # ---------------------------------------------------------------
-  create-release:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.jenkins_only != 'true'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PAT }}
-
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Rebase development onto master
-        run: |
-          git checkout master
-          git pull origin master
-          git checkout development
-          git pull origin development
-          git rebase master
-
-      - name: Merge development into master
-        run: |
-          git checkout master
-          git merge --ff-only development
-          git push origin master
-
-      - name: Create and push tag
-        run: |
-          git tag -a "${{ github.event.inputs.tag_name }}" -m "${{ github.event.inputs.release_title }}"
-          git push origin "${{ github.event.inputs.tag_name }}"
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag_name }}
-          name: ${{ github.event.inputs.release_title }}
-          body: ${{ github.event.inputs.release_notes }}
-          prerelease: ${{ github.event.inputs.prerelease }}
-          draft: ${{ github.event.inputs.draft }}
-          token: ${{ secrets.RELEASE_PAT }}
-
-      - name: Trigger Jenkins build and wait
-        id: jenkins
-        run: |
-          TAG="${{ github.event.inputs.tag_name }}"
-          TITLE="${{ github.event.inputs.release_title }}"
-          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
-
-          echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
-
-          # Encode params for URL query string
-          ENCODED_TAG=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TAG")
-          ENCODED_TITLE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TITLE")
-          ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RELEASE_TYPE")
-
-          JENKINS_URL="https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters?tag_name=${ENCODED_TAG}&release_title=${ENCODED_TITLE}&release_type=${ENCODED_TYPE}"
-
-          # Trigger the build, capture the queue URL from Location header
-          QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST "$JENKINS_URL" \
-            --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-            --fail -L)
-
-          if [ -z "$QUEUE_URL" ]; then
-            QUEUE_URL=$(curl -s -D - -o /dev/null -X POST "$JENKINS_URL" \
-              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
-          fi
-
-          echo "Queue URL: $QUEUE_URL"
-
-          # Poll queue until build number is assigned (up to 10 min)
-          BUILD_URL=""
-          for i in $(seq 1 60); do
-            sleep 10
-            BUILD_URL=$(curl -s "${QUEUE_URL}api/json" \
-              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null)
-            if [ -n "$BUILD_URL" ]; then break; fi
-          done
-
-          if [ -z "$BUILD_URL" ]; then
-            echo "::error::Jenkins job did not start within 10 minutes — check executor availability"
-            exit 1
-          fi
-
-          echo "Build URL: $BUILD_URL"
-          echo "build_url=$BUILD_URL" >> $GITHUB_OUTPUT
-
-          # Poll build until complete (up to 30 min)
-          for i in $(seq 1 180); do
-            sleep 10
-            RESULT=$(curl -s "${BUILD_URL}api/json" \
-              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result') or 'IN_PROGRESS')" 2>/dev/null)
-            echo "Jenkins status: $RESULT"
-            if [ "$RESULT" != "IN_PROGRESS" ] && [ "$RESULT" != "null" ] && [ -n "$RESULT" ]; then break; fi
-          done
-
-          echo "Final Jenkins result: $RESULT"
-          echo "result=$RESULT" >> $GITHUB_OUTPUT
-
-          if [ "$RESULT" != "SUCCESS" ]; then
-            echo "::error::Jenkins build failed with result: $RESULT"
-            exit 1
-          fi
-
-      - name: Notify Google Chat on success
-        if: success()
-        run: |
-          python3 - <<'EOF'
-          import json, os, urllib.request
-
-          webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
-
-          if not webhooks:
-              print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
-          else:
-              title   = "${{ github.event.inputs.release_title }}"
-              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
-              text    = f"*{title}*\n\n<{run_url}|View Release>"
-              payload = json.dumps({"text": text}).encode()
-
-              for webhook in webhooks:
-                  req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
-                  urllib.request.urlopen(req)
-          EOF
-
-      - name: Notify Google Chat on failure
-        if: failure()
-        run: |
-          python3 - <<'EOF'
-          import json, os, urllib.request
-
-          webhook   = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
-          result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
-          build_url = "${{ steps.jenkins.outputs.build_url }}" or "N/A"
-          run_url   = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          if not webhook.strip():
-              print("GOOGLE_CHAT_WEBHOOK_FAILURE not configured, skipping.")
-              exit(0)
-
-          text = (
-              f"*Release: ${{ github.event.inputs.release_title }}* FAILED\n"
-              f"*Jenkins result:* {result}\n"
-              f"*Jenkins build:* {build_url}\n"
-              f"*GitHub run:* {run_url}"
-          )
-
-          payload = json.dumps({"text": text}).encode()
-          req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
-          urllib.request.urlopen(req)
-          EOF
-
-  # ---------------------------------------------------------------
-  # Job 2: jenkins_only=true — re-trigger Jenkins for existing tag.
+  # Triggered automatically when a GitHub release is published.
+  # Derives release type from the tag name, then triggers Jenkins.
   # ---------------------------------------------------------------
   trigger-jenkins:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.jenkins_only == 'true'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Derive release type from tag
+        id: vars
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          TITLE="${{ github.event.release.name }}"
+
+          if echo "$TAG" | grep -qi '\.RC\.'; then
+            RELEASE_TYPE="prerelease"
+          elif echo "$TAG" | grep -qi '\.B\.'; then
+            RELEASE_TYPE="beta"
+          else
+            RELEASE_TYPE="official"
+          fi
+
+          echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
+          echo "tag=$TAG"            >> $GITHUB_OUTPUT
+          echo "title=$TITLE"        >> $GITHUB_OUTPUT
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+
       - name: Trigger Jenkins build and wait
         id: jenkins
         run: |
-          TAG="${{ github.event.inputs.tag_name }}"
-          TITLE="${{ github.event.inputs.release_title }}"
-          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
-
-          echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
+          TAG="${{ steps.vars.outputs.tag }}"
+          TITLE="${{ steps.vars.outputs.title }}"
+          RELEASE_TYPE="${{ steps.vars.outputs.release_type }}"
 
           # Encode params for URL query string
           ENCODED_TAG=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TAG")
           ENCODED_TITLE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TITLE")
           ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RELEASE_TYPE")
 
-          JENKINS_URL="https://jenkins.faveotools.com/job/Faveo-Release-Builder/buildWithParameters?tag_name=${ENCODED_TAG}&release_title=${ENCODED_TITLE}&release_type=${ENCODED_TYPE}"
+          JENKINS_URL="${{ secrets.JENKINS_TRIGGER_URL }}?tag_name=${ENCODED_TAG}&release_title=${ENCODED_TITLE}&release_type=${ENCODED_TYPE}"
 
           # Trigger the build, capture the queue URL from Location header
           QUEUE_URL=$(curl -s -o /dev/null -w "%{redirect_url}" -X POST "$JENKINS_URL" \
@@ -246,7 +70,7 @@ jobs:
           done
 
           if [ -z "$BUILD_URL" ]; then
-            echo "::error::Jenkins job did not start within 10 minutes — check executor availability"
+            echo "::error::Jenkins job did not start within 10 minutes ? check executor availability"
             exit 1
           fi
 
@@ -275,15 +99,15 @@ jobs:
         if: success()
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.request
+          import json, urllib.request
 
           webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
 
           if not webhooks:
               print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
           else:
-              title   = "${{ github.event.inputs.release_title }}"
-              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.tag_name }}"
+              title   = "${{ steps.vars.outputs.title }}"
+              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.vars.outputs.tag }}"
               text    = f"*{title}*\n\n<{run_url}|View Release>"
               payload = json.dumps({"text": text}).encode()
 
@@ -296,7 +120,7 @@ jobs:
         if: failure()
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.request
+          import json, urllib.request
 
           webhook   = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
           result    = "${{ steps.jenkins.outputs.result }}" or "unknown"
@@ -308,7 +132,7 @@ jobs:
               exit(0)
 
           text = (
-              f"*Release: ${{ github.event.inputs.release_title }}* FAILED\n"
+              f"*Release: ${{ steps.vars.outputs.title }}* FAILED\n"
               f"*Jenkins result:* {result}\n"
               f"*Jenkins build:* {build_url}\n"
               f"*GitHub run:* {run_url}"
