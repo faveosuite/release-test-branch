@@ -1,43 +1,101 @@
 name: Release Pipeline
 
+# run-name embeds the Faveo release ID so the workflow_run webhook
+# can identify which release to update (parsed as [faveo:ID]).
+run-name: "Release ${{ inputs.version }} [faveo:${{ inputs.faveo_release_id }}]"
+
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version / tag name (e.g. v9.4.34)'
+        required: true
+      subject:
+        description: 'Release title'
+        required: false
+        default: ''
+      description:
+        description: 'Release notes'
+        required: false
+        default: ''
+      faveo_release_id:
+        description: 'Faveo release ID (injected automatically)'
+        required: false
+        default: ''
 
 jobs:
   # ---------------------------------------------------------------
-  # Triggered automatically when a GitHub release is published.
-  # Derives release type from the tag name, then triggers Jenkins.
+  # Job 1: Create and publish the GitHub release.
+  # Branch is determined by the ref used to dispatch the workflow
+  # (set by Faveo from the configured default_branch).
+  # ---------------------------------------------------------------
+  publish-release:
+    runs-on: ubuntu-latest
+
+    outputs:
+      release_type: ${{ steps.vars.outputs.release_type }}
+
+    steps:
+      - name: Derive release type and publish GitHub release
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          SUBJECT="${{ inputs.subject }}"
+          # Derive release type from version string
+          if echo "$VERSION" | grep -qi '\.RC\.'; then
+            RELEASE_TYPE="prerelease"
+            PRERELEASE_FLAG="--prerelease"
+          elif echo "$VERSION" | grep -qi '\.B\.'; then
+            RELEASE_TYPE="beta"
+            PRERELEASE_FLAG="--prerelease"
+          else
+            RELEASE_TYPE="official"
+            PRERELEASE_FLAG=""
+          fi
+
+          echo "Version: $VERSION | Type: $RELEASE_TYPE"
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+
+          # Write release notes to a file to safely handle special characters
+          cat > /tmp/release_notes.md << 'NOTES_EOF'
+          ${{ inputs.description }}
+          NOTES_EOF
+
+          # Create or update the GitHub release
+          if gh release view "$VERSION" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "Release $VERSION already exists — updating."
+            gh release edit "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --title "$SUBJECT" \
+              --notes-file /tmp/release_notes.md \
+              $PRERELEASE_FLAG
+          else
+            echo "Creating new release $VERSION."
+            gh release create "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --target "master" \
+              --title "$SUBJECT" \
+              --notes-file /tmp/release_notes.md \
+              $PRERELEASE_FLAG
+          fi
+
+  # ---------------------------------------------------------------
+  # Job 2: Trigger Jenkins build and wait for result.
+  # Runs after the GitHub release is published.
   # ---------------------------------------------------------------
   trigger-jenkins:
+    needs: publish-release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Derive release type from tag
-        id: vars
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          TITLE="${{ github.event.release.name }}"
-
-          if echo "$TAG" | grep -qi '\.RC\.'; then
-            RELEASE_TYPE="prerelease"
-          elif echo "$TAG" | grep -qi '\.B\.'; then
-            RELEASE_TYPE="beta"
-          else
-            RELEASE_TYPE="official"
-          fi
-
-          echo "Tag: $TAG | Title: $TITLE | Type: $RELEASE_TYPE"
-          echo "tag=$TAG"            >> $GITHUB_OUTPUT
-          echo "title=$TITLE"        >> $GITHUB_OUTPUT
-          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
-
       - name: Trigger Jenkins build and wait
         id: jenkins
         run: |
-          TAG="${{ steps.vars.outputs.tag }}"
-          TITLE="${{ steps.vars.outputs.title }}"
-          RELEASE_TYPE="${{ steps.vars.outputs.release_type }}"
+          TAG="${{ inputs.version }}"
+          TITLE="${{ inputs.subject }}"
+          RELEASE_TYPE="${{ needs.publish-release.outputs.release_type }}"
 
           # Encode params for URL query string
           ENCODED_TAG=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TAG")
@@ -70,7 +128,7 @@ jobs:
           done
 
           if [ -z "$BUILD_URL" ]; then
-            echo "::error::Jenkins job did not start within 10 minutes ? check executor availability"
+            echo "::error::Jenkins job did not start within 10 minutes — check executor availability"
             exit 1
           fi
 
@@ -106,8 +164,8 @@ jobs:
           if not webhooks:
               print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
           else:
-              title   = "${{ steps.vars.outputs.title }}"
-              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.vars.outputs.tag }}"
+              title   = "${{ inputs.subject }}"
+              run_url = "https://github.com/${{ github.repository }}/releases/tag/${{ inputs.version }}"
               text    = f"*{title}*\n\n<{run_url}|View Release>"
               payload = json.dumps({"text": text}).encode()
 
@@ -132,7 +190,7 @@ jobs:
               exit(0)
 
           text = (
-              f"*Release: ${{ steps.vars.outputs.title }}* FAILED\n"
+              f"*Release: ${{ inputs.subject }}* FAILED\n"
               f"*Jenkins result:* {result}\n"
               f"*Jenkins build:* {build_url}\n"
               f"*GitHub run:* {run_url}"

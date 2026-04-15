@@ -1,0 +1,259 @@
+name: Deploy Pipeline
+
+# run-name embeds the Faveo release ID so the workflow_run webhook
+# can identify which release to update (parsed as [faveo:ID]).
+run-name: "Deploy ${{ inputs.version }} [faveo:${{ inputs.faveo_release_id }}]"
+
+# Required secrets:
+#   DEPLOY_SSH_PRIVATE_KEY  — private key for server SSH access
+#   DEPLOY_SSH_HOST         — server hostname or IP
+#   DEPLOY_SSH_USER         — SSH login username
+#   DEPLOY_SSH_PORT         — (optional) SSH port, defaults to 22
+#   GOOGLE_CHAT_WEBHOOK_SUCCESS — (optional) comma-separated webhook URLs
+#   GOOGLE_CHAT_WEBHOOK_FAILURE — (optional) single webhook URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version / tag name (e.g. v9.4.34)'
+        required: true
+      subject:
+        description: 'Release title'
+        required: false
+        default: ''
+      description:
+        description: 'Release notes'
+        required: false
+        default: ''
+      faveo_release_id:
+        description: 'Faveo release ID (injected automatically)'
+        required: false
+        default: ''
+
+jobs:
+  # ---------------------------------------------------------------
+  # Job 1: Publish the GitHub release with release notes.
+  # ---------------------------------------------------------------
+  publish-release:
+    runs-on: ubuntu-latest
+
+    outputs:
+      release_type: ${{ steps.vars.outputs.release_type }}
+
+    steps:
+      - name: Derive release type and publish GitHub release
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          SUBJECT="${{ inputs.subject }}"
+
+          # Derive release type from version string
+          if echo "$VERSION" | grep -qi '\.RC\.'; then
+            RELEASE_TYPE="prerelease"
+            PRERELEASE_FLAG="--prerelease"
+          elif echo "$VERSION" | grep -qi '\.B\.'; then
+            RELEASE_TYPE="beta"
+            PRERELEASE_FLAG="--prerelease"
+          else
+            RELEASE_TYPE="official"
+            PRERELEASE_FLAG=""
+          fi
+
+          echo "Version: $VERSION | Type: $RELEASE_TYPE"
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+
+          # Write release notes to a file to safely handle special characters
+          cat > /tmp/release_notes.md << 'NOTES_EOF'
+          ${{ inputs.description }}
+          NOTES_EOF
+
+          # Create or update the GitHub release
+          if gh release view "$VERSION" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "Release $VERSION already exists — updating."
+            gh release edit "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --title "$SUBJECT" \
+              --notes-file /tmp/release_notes.md \
+              $PRERELEASE_FLAG
+          else
+            echo "Creating new release $VERSION."
+            gh release create "$VERSION" \
+              --repo "${{ github.repository }}" \
+              --target "master" \
+              --title "$SUBJECT" \
+              --notes-file /tmp/release_notes.md \
+              $PRERELEASE_FLAG
+          fi
+
+  # ---------------------------------------------------------------
+  # Job 2: Build zip from default branch, push to server,
+  #         take SQL backup, extract, and run database:sync.
+  # ---------------------------------------------------------------
+  deploy:
+    needs: publish-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      # ── Build archive ──────────────────────────────────────────────
+      - name: Create deployment archive
+        run: |
+          git archive --format=zip --output=/tmp/release.zip HEAD
+          echo "Archive size: $(du -sh /tmp/release.zip | cut -f1)"
+
+      # ── Attach zip to the GitHub release ──────────────────────────
+      - name: Attach archive to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.version }}" /tmp/release.zip \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      # ── SSH setup ─────────────────────────────────────────────────
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
+            "${{ secrets.DEPLOY_SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      # ── Upload archive to server ───────────────────────────────────
+      - name: Upload archive to server
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            -P "${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
+            /tmp/release.zip \
+            "${{ secrets.DEPLOY_SSH_USER }}@${{ secrets.DEPLOY_SSH_HOST }}:/tmp/release-${{ inputs.version }}.zip"
+          echo "Uploaded release-${{ inputs.version }}.zip to /tmp/"
+
+      # ── Remote: down → backup → extract → permissions → sync → up ──
+      - name: Deploy on server
+        env:
+          VERSION:     ${{ inputs.version }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          BACKUP_PATH: ${{ vars.BACKUP_PATH }}
+          WEB_USER:    ${{ vars.WEB_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
+            "${{ secrets.DEPLOY_SSH_USER }}@${{ secrets.DEPLOY_SSH_HOST }}" \
+            env VERSION="$VERSION" DEPLOY_PATH="$DEPLOY_PATH" BACKUP_PATH="$BACKUP_PATH" WEB_USER="$WEB_USER" bash << 'REMOTE'
+          set -euo pipefail
+
+          ARCHIVE="/tmp/release-${VERSION}.zip"
+
+          # Ensure php artisan up runs on exit — even if any step fails
+          trap 'echo "==> php artisan up"; cd "$DEPLOY_PATH" && php artisan up' EXIT
+
+          # Helper: read a key from Laravel .env
+          get_env() {
+            grep "^${1}=" "${DEPLOY_PATH}/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'\r'
+          }
+
+          # ── 1. Maintenance mode ────────────────────────────────────
+          echo "==> php artisan down"
+          cd "$DEPLOY_PATH"
+          php artisan down
+
+          # ── 2. SQL backup ──────────────────────────────────────────
+          DB_HOST=$(get_env DB_HOST)
+          DB_PORT=$(get_env DB_PORT)
+          DB_NAME=$(get_env DB_DATABASE)
+          DB_USER=$(get_env DB_USERNAME)
+          DB_PASS=$(get_env DB_PASSWORD)
+
+          mkdir -p "$BACKUP_PATH"
+          BACKUP_FILE="${BACKUP_PATH}/${DB_NAME}_$(date +%Y%m%d_%H%M%S)_pre_${VERSION}.sql.gz"
+          echo "==> SQL backup → ${BACKUP_FILE}"
+          mysqldump \
+            -h"$DB_HOST" \
+            -P"${DB_PORT:-3306}" \
+            -u"$DB_USER" \
+            -p"$DB_PASS" \
+            --single-transaction \
+            --quick \
+            "$DB_NAME" | gzip > "$BACKUP_FILE"
+          echo "    Backup size: $(du -sh "$BACKUP_FILE" | cut -f1)"
+
+          # ── 3. Extract archive ─────────────────────────────────────
+          echo "==> Extracting ${ARCHIVE} → ${DEPLOY_PATH}"
+          unzip -o "$ARCHIVE" -d "$DEPLOY_PATH"
+          rm -f "$ARCHIVE"
+          echo "    Extraction complete."
+
+          # ── 4. Fix permissions ─────────────────────────────────────
+          echo "==> Setting permissions (owner: ${WEB_USER})"
+          chown -R "${WEB_USER}":"${WEB_USER}" "$DEPLOY_PATH"
+          find "$DEPLOY_PATH" -type f -exec chmod 644 {} \;
+          find "$DEPLOY_PATH" -type d -exec chmod 755 {} \;
+
+          # ── 5. Database sync ───────────────────────────────────────
+          echo "==> php artisan database:sync"
+          php artisan database:sync
+
+          # ── 6. Bring site back up (trap also covers failure path) ──
+          trap - EXIT
+          echo "==> php artisan up"
+          php artisan up
+
+          echo "==> Deployment complete."
+          REMOTE
+
+      # ── Notifications ──────────────────────────────────────────────
+      - name: Notify Google Chat on success
+        if: success()
+        run: |
+          python3 - <<'EOF'
+          import json, urllib.request
+
+          webhooks = [w.strip() for w in "${{ secrets.GOOGLE_CHAT_WEBHOOK_SUCCESS }}".split(",") if w.strip()]
+
+          if not webhooks:
+              print("GOOGLE_CHAT_WEBHOOK_SUCCESS not configured, skipping.")
+          else:
+              version  = "${{ inputs.version }}"
+              title    = "${{ inputs.subject }}"
+              run_url  = "https://github.com/${{ github.repository }}/releases/tag/" + version
+              text     = (
+                  f"*{title}* deployed successfully\n"
+                  f"*Version:* {version}\n"
+                  f"<{run_url}|View Release>"
+              )
+              payload = json.dumps({"text": text}).encode()
+
+              for webhook in webhooks:
+                  req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+                  urllib.request.urlopen(req)
+          EOF
+
+      - name: Notify Google Chat on failure
+        if: failure()
+        run: |
+          python3 - <<'EOF'
+          import json, urllib.request
+
+          webhook  = "${{ secrets.GOOGLE_CHAT_WEBHOOK_FAILURE }}"
+          run_url  = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if not webhook.strip():
+              print("GOOGLE_CHAT_WEBHOOK_FAILURE not configured, skipping.")
+              exit(0)
+
+          text = (
+              f"*Deploy: ${{ inputs.subject }}* FAILED\n"
+              f"*Version:* ${{ inputs.version }}\n"
+              f"*GitHub run:* {run_url}"
+          )
+          payload = json.dumps({"text": text}).encode()
+          req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req)
+          EOF
