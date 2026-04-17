@@ -141,7 +141,6 @@ jobs:
           VERSION:     ${{ inputs.version }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           BACKUP_PATH: ${{ vars.BACKUP_PATH }}
-          WEB_USER:    ${{ vars.WEB_USER }}
         run: |
           ssh -i ~/.ssh/deploy_key \
             -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
@@ -163,6 +162,7 @@ jobs:
           echo "==> php artisan down"
           cd "$DEPLOY_PATH"
           php artisan down
+          sleep 15
 
           # ── 2. SQL backup ──────────────────────────────────────────
           DB_HOST=$(get_env DB_HOST)
@@ -172,8 +172,8 @@ jobs:
           DB_PASS=$(get_env DB_PASSWORD)
 
           mkdir -p "$BACKUP_PATH"
-          BACKUP_FILE="${BACKUP_PATH}/${DB_NAME}_$(date +%Y%m%d_%H%M%S)_pre_${VERSION}.sql.gz"
-          echo "==> SQL backup → ${BACKUP_FILE}"
+          BACKUP_FILE="${BACKUP_PATH}/${DB_NAME}_$(date +%Y%m%d_%H%M%S)_pre_${VERSION}.sql"
+          echo "==> MySQL backup → ${BACKUP_FILE}"
           mysqldump \
             -h"$DB_HOST" \
             -P"${DB_PORT:-3306}" \
@@ -181,7 +181,7 @@ jobs:
             -p"$DB_PASS" \
             --single-transaction \
             --quick \
-            "$DB_NAME" | gzip > "$BACKUP_FILE"
+            "$DB_NAME" > "$BACKUP_FILE"
           echo "    Backup size: $(du -sh "$BACKUP_FILE" | cut -f1)"
 
           # ── 3. Extract archive ─────────────────────────────────────
@@ -190,13 +190,7 @@ jobs:
           rm -f "$ARCHIVE"
           echo "    Extraction complete."
 
-          # ── 4. Fix permissions ─────────────────────────────────────
-          echo "==> Setting permissions (owner: ${WEB_USER})"
-          chown -R "${WEB_USER}":"${WEB_USER}" "$DEPLOY_PATH"
-          find "$DEPLOY_PATH" -type f -exec chmod 644 {} \;
-          find "$DEPLOY_PATH" -type d -exec chmod 755 {} \;
-
-          # ── 5. Database sync ───────────────────────────────────────
+          # ── 4. Database sync ───────────────────────────────────────
           echo "==> php artisan database:sync"
           php artisan database:sync
 
