@@ -2,7 +2,7 @@ name: Release Pipeline
 
 # run-name embeds the Faveo release ID so the workflow_run webhook
 # can identify which release to update (parsed as [faveo:ID]).
-run-name: "Release ${{ inputs.version }} [faveo:${{ inputs.faveo_release_id }}]"
+run-name: "Release ${{ inputs.version }} [faveo:${{ inputs.release_id }}]"
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ on:
         description: 'Release notes'
         required: false
         default: ''
-      faveo_release_id:
+      release_id:
         description: 'Faveo release ID (injected automatically)'
         required: false
         default: ''

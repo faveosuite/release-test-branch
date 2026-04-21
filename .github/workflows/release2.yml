@@ -2,7 +2,7 @@ name: Deploy Pipeline
 
 # run-name embeds the Faveo release ID so the workflow_run webhook
 # can identify which release to update (parsed as [faveo:ID]).
-run-name: "Deploy ${{ inputs.version }} [faveo:${{ inputs.faveo_release_id }}]"
+run-name: "Deploy ${{ inputs.version }} [faveo:${{ inputs.release_id }}]"
 
 # Required secrets:
 #   DEPLOY_SSH_PRIVATE_KEY  — private key for server SSH access
@@ -26,7 +26,7 @@ on:
         description: 'Release notes'
         required: false
         default: ''
-      faveo_release_id:
+      release_id:
         description: 'Faveo release ID (injected automatically)'
         required: false
         default: ''
